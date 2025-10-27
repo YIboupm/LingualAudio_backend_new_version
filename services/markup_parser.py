@@ -1,4 +1,11 @@
-# services/markup_parser.py
+# services/markup_parser_enhanced.py
+"""
+增强版 SIELE 标记解析器
+支持题型：
+1. Tarea 1-3: 独立选择题（已有）
+2. Tarea 4: 完形填空 - 选择片段 (cloze-fragments)
+3. Tarea 5: 完形填空 - 选择单词 (cloze-multiple-choice)
+"""
 import re
 from typing import List, Dict, Any, Tuple
 import spacy
@@ -7,12 +14,14 @@ import spacy
 class SieleMarkupParser:
     """
     SIELE 阅读材料标记解析器
+    
     支持的标记：
     - ::tarea:N:: - Tarea 编号
     - ::title:xxx:: - 标题
     - ::zh::...::zh:: - 中文翻译
     - ::grammar::...::grammar:: - 语法讲解
-    - ::question::...::question:: - 题目
+    - ::question::...::question:: - 独立题目（Tarea 1-3）
+    - [[gap1|A|B|C|D]]answer:B[[/gap]] - 嵌入式完形填空
     - --- - 段落分隔符
     """
     
@@ -30,6 +39,7 @@ class SieleMarkupParser:
                 "plain_text_es": "...",
                 "paragraphs": [...],
                 "questions": [...],
+                "question_type": "single_choice" | "cloze_fragments" | "cloze_mc",
                 "lemmas": [...],
                 "pos_distribution": {...}
             }
@@ -40,6 +50,7 @@ class SieleMarkupParser:
             "plain_text_es": "",
             "paragraphs": [],
             "questions": [],
+            "question_type": "single_choice",  # 默认类型
             "lemmas": [],
             "pos_distribution": {}
         }
@@ -48,9 +59,20 @@ class SieleMarkupParser:
         result["tarea_number"] = self._extract_tarea_number(raw_markup_text)
         result["title"] = self._extract_title(raw_markup_text)
         
-        # 2. 提取题目（先提取，因为题目不参与段落分析）
-        raw_markup_text, questions = self._extract_questions(raw_markup_text)
-        result["questions"] = questions
+        # 2. 判断题型并提取题目
+        if result["tarea_number"] in [4, 5]:
+            # Tarea 4-5: 完形填空（嵌入式）
+            raw_markup_text, questions, question_type = self._extract_cloze_questions(
+                raw_markup_text, 
+                result["tarea_number"]
+            )
+            result["questions"] = questions
+            result["question_type"] = question_type
+        else:
+            # Tarea 1-3: 独立选择题
+            raw_markup_text, questions = self._extract_questions(raw_markup_text)
+            result["questions"] = questions
+            result["question_type"] = "single_choice"
         
         # 3. 移除元数据标记
         content_text = self._remove_metadata_tags(raw_markup_text)
@@ -73,7 +95,7 @@ class SieleMarkupParser:
             if para_data:
                 result["paragraphs"].append(para_data)
                 spanish_text_parts.append(para_data["text_es"])
-                current_char_pos += len(para_data["text_es"]) + 1  # +1 for space
+                current_char_pos += len(para_data["text_es"]) + 1
         
         # 6. 生成纯西班牙语文本
         result["plain_text_es"] = "\n\n".join(spanish_text_parts)
@@ -114,9 +136,74 @@ class SieleMarkupParser:
         match = re.search(r'::title:(.+?)::', text)
         return match.group(1).strip() if match else None
     
+    def _extract_cloze_questions(
+        self, 
+        text: str, 
+        tarea_number: int
+    ) -> Tuple[str, List[Dict], str]:
+        """
+        提取完形填空题目（Tarea 4-5）
+        
+        标记格式:
+        [[gap1|A|B|C|D]]answer:B[[/gap]]
+        或
+        [[gap1|opción1|opción2|opción3]]answer:2[[/gap]]
+        
+        Returns:
+            (清理后的文本, 题目列表, 题型)
+        """
+        questions = []
+        question_type = "cloze_fragments" if tarea_number == 4 else "cloze_mc"
+        
+        # 匹配 [[gapN|...]]answer:X[[/gap]]
+        pattern = r'\[\[gap(\d+)\|([^\]]+)\]\]answer:([^\[]+)\[\[/gap\]\]'
+        matches = re.finditer(pattern, text)
+        
+        for match in matches:
+            gap_number = int(match.group(1))
+            options_str = match.group(2)
+            correct_answer = match.group(3).strip()
+            
+            # 分割选项
+            options_list = [opt.strip() for opt in options_str.split('|')]
+            
+            # 构建选项列表
+            options = []
+            for i, option_content in enumerate(options_list):
+                # 对于 Tarea 4，选项可能是 A、B、C、D
+                # 对于 Tarea 5，选项可能是具体的词
+                label = chr(65 + i) if len(options_list) <= 5 else str(i + 1)
+                
+                # 判断是否是正确答案
+                is_correct = False
+                if correct_answer.upper() == label:
+                    is_correct = True
+                elif correct_answer == str(i + 1):
+                    is_correct = True
+                elif correct_answer == option_content:
+                    is_correct = True
+                
+                options.append({
+                    "label": label,
+                    "content": option_content,
+                    "is_correct": is_correct
+                })
+            
+            questions.append({
+                "question_id": gap_number,
+                "gap_id": f"gap{gap_number}",
+                "question_type": question_type,
+                "options": options
+            })
+        
+        # 清理文本：将 [[gap...]] 替换为占位符
+        cleaned_text = re.sub(pattern, r'___GAP\1___', text)
+        
+        return cleaned_text, questions, question_type
+    
     def _extract_questions(self, text: str) -> Tuple[str, List[Dict]]:
         """
-        提取题目块
+        提取独立题目（Tarea 1-3）
         
         Returns:
             (清理后的文本, 题目列表)
@@ -139,28 +226,17 @@ class SieleMarkupParser:
     
     def _parse_question_block(self, block: str) -> List[Dict]:
         """
-        解析题目块
-        
-        示例输入:
-        1. Isabel escribe este correo a Sara para...
-           [A] comer con ella.
-           [B] invitarla a un viaje.
-           [C] hablarle de su nuevo trabajo.
-        ::answer:B::
-        
-        2. En el texto se dice...
+        解析独立题目块（Tarea 1-3）- 修复版本
         """
         questions = []
         
-        # 按题号分割
-        question_texts = re.split(r'\n(\d+)\.\s+', block)
+        # 使用 finditer 直接找到所有题目
+        pattern = r'(\d+)\.\s+(.+?)(?=\d+\.\s+|$)'
+        matches = re.finditer(pattern, block, re.DOTALL)
         
-        for i in range(1, len(question_texts), 2):
-            if i + 1 > len(question_texts):
-                break
-            
-            question_num = int(question_texts[i])
-            question_content = question_texts[i + 1].strip()
+        for match in matches:
+            question_num = int(match.group(1))
+            question_content = match.group(2).strip()
             
             # 提取题干和选项
             lines = question_content.split('\n')
@@ -171,20 +247,23 @@ class SieleMarkupParser:
             
             for line in lines[1:]:
                 line = line.strip()
+                if not line:
+                    continue
                 
                 # 匹配选项 [A] text
                 option_match = re.match(r'\[([A-Z])\]\s+(.+)', line)
                 if option_match:
                     label = option_match.group(1)
                     content = option_match.group(2).strip()
+                    content = re.sub(r'::answer:[A-Z]::', '', content).strip()
                     options.append({
                         "label": label,
                         "content": content,
-                        "is_correct": False  # 暂时设为 False
+                        "is_correct": False
                     })
                 
                 # 匹配答案 ::answer:B::
-                answer_match = re.search(r'::answer:([A-Z])::',line)
+                answer_match = re.search(r'::answer:([A-Z])::', line)
                 if answer_match:
                     correct_answer = answer_match.group(1)
             
@@ -194,11 +273,14 @@ class SieleMarkupParser:
                     if opt["label"] == correct_answer:
                         opt["is_correct"] = True
             
-            questions.append({
-                "question_id": question_num,
-                "stem": stem,
-                "options": options
-            })
+            # 只添加有选项的题目
+            if options:
+                questions.append({
+                    "question_id": question_num,
+                    "stem": stem,
+                    "options": options,
+                    "question_type": "single_choice"
+                })
         
         return questions
     
@@ -216,21 +298,13 @@ class SieleMarkupParser:
     ) -> Dict[str, Any]:
         """
         解析单个段落
-        
-        输入示例:
-        Hola Sara, ¿qué tal todo?...
-        
-        ::zh::你好，萨拉...::zh::
-        
-        ::grammar::
-        - dolía [过去未完成时] 描述过去的状态
-        - me sentí [简单过去时+反身动词] 表达感觉的变化
-        ::grammar::
         """
-        
         # 1. 提取西班牙语文本（第一部分，直到遇到标记）
         spanish_match = re.match(r'^(.*?)(?=::zh::|::grammar::|$)', raw_para, re.DOTALL)
         text_es = spanish_match.group(1).strip() if spanish_match else raw_para.strip()
+        
+        # 移除完形填空的占位符（如果有）
+        text_es = re.sub(r'___GAP\d+___', '[___]', text_es)
         
         # 2. 提取中文翻译
         zh_match = re.search(r'::zh::(.*?)::zh::', raw_para, re.DOTALL)
@@ -242,12 +316,10 @@ class SieleMarkupParser:
         
         if grammar_match:
             grammar_text = grammar_match.group(1).strip()
-            # 解析每一行语法讲解
             for line in grammar_text.split('\n'):
                 line = line.strip()
                 if line.startswith('-'):
                     line = line[1:].strip()
-                    # 格式: word [类型] 说明
                     note_match = re.match(r'(.+?)\s*\[(.+?)\]\s*(.+)', line)
                     if note_match:
                         grammar_notes.append({

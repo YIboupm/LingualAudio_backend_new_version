@@ -26,11 +26,17 @@ sys.path.append(str(BASE_DIR / "fastapi_backend"))
 from audio_backend.app.main import get_app as get_audio_app
 from fastapi_backend.main import get_app as get_user_app
 
+# 导入 MongoDB 初始化函数
+from audio_backend.app.core.mongodb import init_mongodb, close_mongodb
+
 def create_unified_app() -> FastAPI:
     load_dotenv()
 
     SECRET_KEY = os.getenv("SECRET_KEY")
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+    MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "siele_app")
+    
     if not SECRET_KEY:
         raise RuntimeError("Missing SECRET_KEY in .env")
 
@@ -55,30 +61,48 @@ def create_unified_app() -> FastAPI:
         max_age=86400,
     )
 
-    # 3) 统一初始化 fastapi-cache2（总入口负责）
+    # 3) 统一初始化 fastapi-cache2 和 MongoDB（总入口负责）
     @app.on_event("startup")
-    async def _init_cache():
+    async def _init_services():
+        # 初始化 Redis 缓存
         try:
             r = aioredis.from_url(REDIS_URL, encoding="utf8", decode_responses=True)
             FastAPICache.init(RedisBackend(r), prefix="fastapi-cache")
-            print(f"[run_main] fastapi-cache initialized with Redis: {REDIS_URL}")
+            print(f"[run_main] ✅ fastapi-cache initialized with Redis: {REDIS_URL}")
         except Exception as e:
             FastAPICache.init(InMemoryBackend(), prefix="fastapi-cache")
-            print(f"[run_main] Redis init failed ({e}), fallback to InMemory cache.")
+            print(f"[run_main] ⚠️  Redis init failed ({e}), fallback to InMemory cache.")
+        
+        # 初始化 MongoDB
+        try:
+            init_mongodb(MONGODB_URL, MONGODB_DB_NAME)
+            print(f"[run_main] ✅ MongoDB initialized: {MONGODB_DB_NAME}")
+        except Exception as e:
+            print(f"[run_main] ❌ MongoDB init failed: {e}")
+            raise
 
-    # 4) 合并路由（把两个子 app 的 routes 挂到总 app 上）
+    # 4) 关闭连接
+    @app.on_event("shutdown")
+    async def _close_services():
+        try:
+            close_mongodb()
+            print("[run_main] MongoDB connection closed")
+        except Exception as e:
+            print(f"[run_main] Error closing MongoDB: {e}")
+
+    # 5) 合并路由（把两个子 app 的 routes 挂到总 app 上）
     for route in audio_app.router.routes:
         app.router.routes.append(route)
     for route in user_app.router.routes:
         app.router.routes.append(route)
 
-    # 5) 合并异常处理器（顺序：先 audio，再 user；可按需要调整）
+    # 6) 合并异常处理器（顺序：先 audio，再 user；可按需要调整）
     for key, handler in audio_app.exception_handlers.items():
         app.add_exception_handler(key, handler)
     for key, handler in user_app.exception_handlers.items():
         app.add_exception_handler(key, handler)
 
-    # 6) 静态文件（子 app 的 app.mount 不会自动带过来，所以在总 app 再挂一次）
+    # 7) 静态文件（子 app 的 app.mount 不会自动带过来，所以在总 app 再挂一次）
     #    对齐 fastapi_backend/main.py 的 /files 逻辑
     env_upload = os.getenv("UPLOAD_DIR")
     if env_upload:
@@ -90,7 +114,7 @@ def create_unified_app() -> FastAPI:
     print("[run_main] STATIC /files =>", uploads_dir)
     app.mount("/files", StaticFiles(directory=str(uploads_dir)), name="uploaded_files")
 
-    # 7) 统一的请求体验证错误处理（可选）
+    # 8) 统一的请求体验证错误处理（可选）
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request, exc):
         return JSONResponse(
@@ -98,7 +122,7 @@ def create_unified_app() -> FastAPI:
             content={"detail": exc.errors(), "body": exc.body},
         )
 
-    # 8) 健康检查
+    # 9) 健康检查
     @app.get("/")
     def health_check():
         return {"status": "Unified backend running!"}

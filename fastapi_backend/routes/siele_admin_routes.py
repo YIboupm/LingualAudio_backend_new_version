@@ -1,15 +1,6 @@
+# fastapi_backend/routes/siele_admin_routes.py
 """
-SIELE 阅读材料管理路由 - 独立版本
-可以直接复制到 fastapi_backend/routes/ 使用
-
-依赖项（需要在项目根目录）:
-- markup_parser.py
-- nlp_service.py  
-- mongodb.py
-- config.py
-- database.py
-- reading_exame.py
-- embedding_service.py
+SIELE 阅读材料管理路由
 """
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -23,35 +14,35 @@ import sys
 from pathlib import Path
 
 # 添加项目根目录到 Python 路径
-# 根据你的项目结构调整这个路径
 project_root = Path(__file__).resolve().parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-# 导入共享模块（从项目根目录）
+# 正确的导入路径
+from audio_backend.app.core.database import get_db
+from audio_backend.app.core.mongodb import get_mongo_db
+from audio_backend.app.models.siele_reading_models import SieleReadingPassage
+from fastapi_backend.Recommendation_Algorithm.embedding_service import get_embedding
+
+# 动态导入（如果文件存在）
 try:
-    from database import get_db
-    from audio_backend.app.core.mongodb import get_mongo_db
+    sys.path.insert(0, str(project_root))
     from services.markup_parser import SieleMarkupParser
-    from nlp_service import get_nlp_service
-    from reading_exame import SieleReadingPassage
-    from fastapi_backend.Recommendation_Algorithm.embedding_service import get_embedding
+    from services.nlp_service import get_nlp_service
 except ImportError as e:
-    print(f"⚠️  Warning: Failed to import reading modules: {e}")
-    print(f"   Make sure these files exist in project root: {project_root}")
-    # 创建空的占位符，防止导入错误
-    def get_db(): raise NotImplementedError("database module not available")
-    def get_mongo_db(): raise NotImplementedError("mongodb module not available")
-    class SieleMarkupParser: pass
-    def get_nlp_service(): raise NotImplementedError("nlp_service not available")
-    class SieleReadingPassage: pass
-    def get_embedding(text): raise NotImplementedError("embedding_service not available")
+    print(f"⚠️  Warning: Failed to import modules: {e}")
+    class SieleMarkupParser:
+        def parse(self, text):
+            raise NotImplementedError("markup_parser.py not found")
+    def get_nlp_service():
+        raise NotImplementedError("nlp_service.py not found")
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/reading/admin", tags=["Reading Admin"])
 
 
+# ==================== Pydantic Models ====================
 class MarkupTextInput(BaseModel):
     """标记文本输入"""
     markup_text: str
@@ -69,6 +60,7 @@ class PassageResponse(BaseModel):
     word_count: int
 
 
+# ==================== API Routes ====================
 @router.post("/preview")
 async def preview_markup(data: MarkupTextInput):
     """
@@ -89,8 +81,6 @@ async def preview_markup(data: MarkupTextInput):
         nlp_service = get_nlp_service()
         if result["plain_text_es"]:
             nlp_result = nlp_service.analyze_text(result["plain_text_es"])
-            result["lemmas"] = nlp_result["lemmas"]
-            result["pos_distribution"] = nlp_result["pos_distribution"]
             result["word_count"] = nlp_result["word_count"]
             result["sentence_count"] = nlp_result["sentence_count"]
             result["difficulty_estimate"] = nlp_service.estimate_difficulty(
@@ -145,8 +135,13 @@ async def create_passage_from_markup(
         passage = SieleReadingPassage(
             tarea_number=parsed_data["tarea_number"],
             title=parsed_data["title"],
-            content_doc={"type": "markup", "raw": data.markup_text},
-            plain_text=parsed_data["plain_text_es"],
+            raw_markup_text=data.markup_text,  # 保存原始标记文本
+            plain_text_es=parsed_data["plain_text_es"],
+            paragraphs=parsed_data["paragraphs"],
+            lemmas=parsed_data["lemmas"],
+            pos_distribution=parsed_data["pos_distribution"],
+            word_count=nlp_result["word_count"],
+            sentence_count=nlp_result["sentence_count"],
             difficulty_level=nlp_service.estimate_difficulty(
                 nlp_result["pos_distribution"],
                 nlp_result["word_count"]
@@ -170,6 +165,9 @@ async def create_passage_from_markup(
             }
             result = await questions_collection.insert_one(mongo_doc)
             mongo_id = str(result.inserted_id)
+            
+            # 更新 PostgreSQL 中的 mongo_questions_id
+            passage.mongo_questions_id = mongo_id
         
         db_pg.commit()
         db_pg.refresh(passage)
@@ -219,15 +217,22 @@ async def update_passage_from_markup(
             parsed_data["plain_text_es"]
         )
         
+        # 更新字段
         passage.title = parsed_data["title"]
-        passage.content_doc = {"type": "markup", "raw": data.markup_text}
-        passage.plain_text = parsed_data["plain_text_es"]
+        passage.raw_markup_text = data.markup_text
+        passage.plain_text_es = parsed_data["plain_text_es"]
+        passage.paragraphs = parsed_data["paragraphs"]
+        passage.lemmas = parsed_data["lemmas"]
+        passage.pos_distribution = parsed_data["pos_distribution"]
         passage.embedding = embedding
+        passage.word_count = nlp_result["word_count"]
+        passage.sentence_count = nlp_result["sentence_count"]
         passage.difficulty_level = nlp_service.estimate_difficulty(
             nlp_result["pos_distribution"],
             nlp_result["word_count"]
         )
         
+        # 更新题目
         if parsed_data["questions"]:
             questions_collection = db_mongo["siele_reading_questions"]
             existing_doc = await questions_collection.find_one({"passage_id": passage_id})
@@ -248,7 +253,8 @@ async def update_passage_from_markup(
                     "questions": parsed_data["questions"],
                     "created_at": datetime.utcnow()
                 }
-                await questions_collection.insert_one(mongo_doc)
+                result = await questions_collection.insert_one(mongo_doc)
+                passage.mongo_questions_id = str(result.inserted_id)
         
         db_pg.commit()
         logger.info(f"✅ Updated passage {passage_id}")
@@ -273,14 +279,9 @@ async def get_passage_raw_markup(
     if not passage:
         raise HTTPException(404, "文章不存在")
     
-    if isinstance(passage.content_doc, dict) and "raw" in passage.content_doc:
-        raw_markup = passage.content_doc["raw"]
-    else:
-        raw_markup = ""
-    
     return {
         "passage_id": passage_id,
-        "raw_markup_text": raw_markup,
+        "raw_markup_text": passage.raw_markup_text or "",
         "title": passage.title,
         "tarea_number": passage.tarea_number
     }
@@ -298,9 +299,11 @@ async def delete_passage(
         if not passage:
             raise HTTPException(404, "文章不存在")
         
+        # 删除 MongoDB 中的题目
         questions_collection = db_mongo["siele_reading_questions"]
         await questions_collection.delete_many({"passage_id": passage_id})
         
+        # 删除 PostgreSQL 记录
         db_pg.delete(passage)
         db_pg.commit()
         

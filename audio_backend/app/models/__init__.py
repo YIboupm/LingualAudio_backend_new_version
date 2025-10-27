@@ -1,4 +1,3 @@
-# audio_backend/app/models/__init__.py
 # ============================================================
 # 导入通用模型
 # ============================================================
@@ -9,22 +8,7 @@ from .word import Word
 # ============================================================
 # 导入阅读模块
 # ============================================================
-from .siele_reading_models import (
-    # 常量
-    QUESTION_TYPE_SINGLE_CHOICE,
-    QUESTION_TYPE_MATCHING,
-    QUESTION_TYPE_CLOZE_FRAGMENTS,
-    QUESTION_TYPE_CLOZE_MC,
-    VALID_QUESTION_TYPES,
-
-    # 模型
-    SieleReadingPassage,
-    SieleReadingQuestion,
-    SieleReadingOption,
-    SieleReadingPracticeSession,
-    SieleReadingUserAnswer,
-    SieleReadingUserStats,
-)
+from .siele_reading_models import SieleReadingPassage
 
 # ============================================================
 # 导入写作模块（SIELE + DELE）
@@ -61,20 +45,8 @@ __all__ = [
     "User",
     "Word",
 
-    # ---- 阅读常量 ----
-    "QUESTION_TYPE_SINGLE_CHOICE",
-    "QUESTION_TYPE_MATCHING",
-    "QUESTION_TYPE_CLOZE_FRAGMENTS",
-    "QUESTION_TYPE_CLOZE_MC",
-    "VALID_QUESTION_TYPES",
-
     # ---- 阅读模型 ----
     "SieleReadingPassage",
-    "SieleReadingQuestion",
-    "SieleReadingOption",
-    "SieleReadingPracticeSession",
-    "SieleReadingUserAnswer",
-    "SieleReadingUserStats",
 
     # ---- SIELE 写作模块 ----
     "SieleWritingTask",
@@ -94,7 +66,7 @@ __all__ = [
     # ---- 听力素材模块 ----
     "ListeningMaterial",
 
-        # ---- 旅游模块 ----
+    # ---- 旅游模块 ----
     "Country",
     "City",
     "Place",
