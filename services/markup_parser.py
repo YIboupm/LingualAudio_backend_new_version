@@ -1,58 +1,84 @@
 # services/markup_parser_enhanced.py
-"""
-增强版 SIELE 标记解析器
-支持题型：
-1. Tarea 1-3: 独立选择题（已有）
-2. Tarea 4: 完形填空 - 选择片段 (cloze-fragments)
-3. Tarea 5: 完形填空 - 选择单词 (cloze-multiple-choice)
-"""
 import re
 from typing import List, Dict, Any, Tuple
 import spacy
+from functools import lru_cache
 
 
 class SieleMarkupParser:
     """
-    SIELE 阅读材料标记解析器
-    
-    支持的标记：
-    - ::tarea:N:: - Tarea 编号
-    - ::title:xxx:: - 标题
-    - ::zh::...::zh:: - 中文翻译
-    - ::grammar::...::grammar:: - 语法讲解
-    - ::question::...::question:: - 独立题目（Tarea 1-3）
-    - [[gap1|A|B|C|D]]answer:B[[/gap]] - 嵌入式完形填空
-    - --- - 段落分隔符
+    SIELE 阅读材料标记解析器 + 词汇标注
     """
     
-    def __init__(self):
+    def __init__(self, db_session=None):
         self.nlp = spacy.load("es_core_news_sm")
+        self.db_session = db_session
+        self._word_mapping = None
+        self._word_fallback = None
+    
+    def _init_word_mapping(self):
+        """初始化单词映射表"""
+        if self._word_mapping is not None:
+            return
+        
+        if self.db_session is None:
+            # 如果没有数据库连接，跳过词汇标注
+            self._word_mapping = {}
+            self._word_fallback = {}
+            return
+        
+        try:
+            from audio_backend.app.models.word import Word
+            
+            words = self.db_session.query(Word).filter(
+                Word.lang_code == "es"
+            ).all()
+            
+            self._word_mapping = {}
+            self._word_fallback = {}
+            
+            for w in words:
+                # 精确匹配: (lemma, pos) -> word_id
+                key = (w.lemma.lower(), w.pos.lower())
+                self._word_mapping[key] = w.id
+                
+                # 回退匹配: lemma -> [word_ids]
+                self._word_fallback.setdefault(w.lemma.lower(), []).append(w.id)
+        
+        except Exception as e:
+            print(f"⚠️  词汇映射初始化失败: {e}")
+            self._word_mapping = {}
+            self._word_fallback = {}
     
     def parse(self, raw_markup_text: str) -> Dict[str, Any]:
         """
-        解析标记文本
+        解析标记文本 + 生成词汇标注
         
         Returns:
             {
                 "tarea_number": 1,
                 "title": "...",
+                "raw_markup_text": "...",  # ⭐ 原始标记文本
                 "plain_text_es": "...",
                 "paragraphs": [...],
                 "questions": [...],
                 "question_type": "single_choice" | "cloze_fragments" | "cloze_mc",
                 "lemmas": [...],
-                "pos_distribution": {...}
+                "pos_distribution": {...},
+                "annotations": [...]  # ⭐ 词汇标注
             }
         """
         result = {
             "tarea_number": None,
             "title": None,
+            "raw_markup_text": raw_markup_text,  # ⭐ 保存原始文本
             "plain_text_es": "",
             "paragraphs": [],
             "questions": [],
-            "question_type": "single_choice",  # 默认类型
+            "question_type": "single_choice",
             "lemmas": [],
-            "pos_distribution": {}
+            "pos_distribution": {},
+            "annotations": []  # ⭐ 词汇标注
         }
         
         # 1. 提取元数据
@@ -61,7 +87,6 @@ class SieleMarkupParser:
         
         # 2. 判断题型并提取题目
         if result["tarea_number"] in [4, 5]:
-            # Tarea 4-5: 完形填空（嵌入式）
             raw_markup_text, questions, question_type = self._extract_cloze_questions(
                 raw_markup_text, 
                 result["tarea_number"]
@@ -69,7 +94,6 @@ class SieleMarkupParser:
             result["questions"] = questions
             result["question_type"] = question_type
         else:
-            # Tarea 1-3: 独立选择题
             raw_markup_text, questions = self._extract_questions(raw_markup_text)
             result["questions"] = questions
             result["question_type"] = "single_choice"
@@ -89,7 +113,6 @@ class SieleMarkupParser:
             if not raw_para:
                 continue
             
-            # 解析段落（提取西班牙语、翻译、语法）
             para_data = self._parse_paragraph(raw_para, idx + 1, current_char_pos)
             
             if para_data:
@@ -124,15 +147,170 @@ class SieleMarkupParser:
                 result["pos_distribution"][token.pos_] = \
                     result["pos_distribution"].get(token.pos_, 0) + 1
         
+        # 8. ⭐ 生成词汇标注
+        result["annotations"] = self._generate_annotations(doc)
+        
         return result
     
+    def _generate_annotations(self, doc) -> List[Dict[str, Any]]:
+        """
+        生成词汇标注（映射到 words 表）
+        
+        Returns:
+            [
+                {
+                    "index": 0,
+                    "word": "Hola",
+                    "lemma": "hola",
+                    "pos": "intj",
+                    "start_char": 0,
+                    "end_char": 4,
+                    "word_id": 12345  # 关联到 words 表
+                },
+                ...
+            ]
+        """
+        # 初始化词汇映射
+        self._init_word_mapping()
+        
+        annotations = []
+        
+        for i, token in enumerate(doc):
+            # 跳过标点和空格
+            if token.is_punct or token.is_space:
+                continue
+            
+            word_text = token.text.lower()
+            lemma = token.lemma_.lower()
+            pos = token.pos_.lower()
+            
+            # 查找 word_id
+            word_id = None
+            
+            # 策略1: 精确匹配 (lemma, pos)
+            if (lemma, pos) in self._word_mapping:
+                word_id = self._word_mapping[(lemma, pos)]
+            
+            # 策略2: 回退到 lemma
+            elif lemma in self._word_fallback:
+                word_id = self._word_fallback[lemma][0]  # 取第一个
+            
+            # 策略3: 回退到原词
+            elif word_text in self._word_fallback:
+                word_id = self._word_fallback[word_text][0]
+            
+            annotations.append({
+                "index": i,
+                "word": token.text,
+                "lemma": lemma,
+                "pos": pos,
+                "start_char": token.idx,
+                "end_char": token.idx + len(token.text),
+                "word_id": word_id  # 可能为 None
+            })
+        
+        return annotations
+    
+    def generate_annotated_html(self, plain_text_es: str, annotations: List[Dict]) -> str:
+        """
+        生成带词汇标注的 HTML
+        
+        Args:
+            plain_text_es: 纯西班牙语文本
+            annotations: 词汇标注列表
+        
+        Returns:
+            HTML 字符串，每个单词都有 data-word-id 属性
+        """
+        if not annotations:
+            return plain_text_es
+        
+        # 按字符位置排序
+        annotations = sorted(annotations, key=lambda x: x["start_char"])
+        
+        html_parts = []
+        last_pos = 0
+        
+        for ann in annotations:
+            start = ann["start_char"]
+            end = ann["end_char"]
+            word = ann["word"]
+            word_id = ann.get("word_id") or ""
+            lemma = ann["lemma"]
+            pos = ann["pos"]
+            
+            # 添加单词之前的文本
+            if start > last_pos:
+                html_parts.append(plain_text_es[last_pos:start])
+            
+            # 添加标注的单词
+            html_parts.append(
+                f'<span data-word-id="{word_id}" '
+                f'data-lemma="{lemma}" '
+                f'data-pos="{pos}" '
+                f'class="word-link">'
+                f'{word}</span>'
+            )
+            
+            last_pos = end
+        
+        # 添加剩余文本
+        if last_pos < len(plain_text_es):
+            html_parts.append(plain_text_es[last_pos:])
+        
+        return ''.join(html_parts)
+    
+    def generate_paragraph_html(self, paragraphs: List[Dict], annotations: List[Dict]) -> List[Dict]:
+        """
+        为每个段落生成带标注的 HTML
+        
+        Args:
+            paragraphs: 段落列表
+            annotations: 词汇标注列表
+        
+        Returns:
+            更新后的段落列表（增加 html_es 字段）
+        """
+        result = []
+        
+        for para in paragraphs:
+            start_char = para["start_char"]
+            end_char = para["end_char"]
+            
+            # 筛选这个段落的标注
+            para_annotations = [
+                ann for ann in annotations
+                if start_char <= ann["start_char"] < end_char
+            ]
+            
+            # 调整标注的字符位置（相对于段落开头）
+            adjusted_annotations = []
+            for ann in para_annotations:
+                adjusted = ann.copy()
+                adjusted["start_char"] -= start_char
+                adjusted["end_char"] -= start_char
+                adjusted_annotations.append(adjusted)
+            
+            # 生成 HTML
+            html_es = self.generate_annotated_html(
+                para["text_es"],
+                adjusted_annotations
+            )
+            
+            # 添加到结果
+            para_copy = para.copy()
+            para_copy["html_es"] = html_es
+            result.append(para_copy)
+        
+        return result
+    
+    # ========== 以下是原有的解析方法（不变） ==========
+    
     def _extract_tarea_number(self, text: str) -> int:
-        """提取 Tarea 编号"""
         match = re.search(r'::tarea:(\d+)::', text)
         return int(match.group(1)) if match else 1
     
     def _extract_title(self, text: str) -> str:
-        """提取标题"""
         match = re.search(r'::title:(.+?)::', text)
         return match.group(1).strip() if match else None
     
@@ -141,21 +319,9 @@ class SieleMarkupParser:
         text: str, 
         tarea_number: int
     ) -> Tuple[str, List[Dict], str]:
-        """
-        提取完形填空题目（Tarea 4-5）
-        
-        标记格式:
-        [[gap1|A|B|C|D]]answer:B[[/gap]]
-        或
-        [[gap1|opción1|opción2|opción3]]answer:2[[/gap]]
-        
-        Returns:
-            (清理后的文本, 题目列表, 题型)
-        """
         questions = []
         question_type = "cloze_fragments" if tarea_number == 4 else "cloze_mc"
         
-        # 匹配 [[gapN|...]]answer:X[[/gap]]
         pattern = r'\[\[gap(\d+)\|([^\]]+)\]\]answer:([^\[]+)\[\[/gap\]\]'
         matches = re.finditer(pattern, text)
         
@@ -164,17 +330,12 @@ class SieleMarkupParser:
             options_str = match.group(2)
             correct_answer = match.group(3).strip()
             
-            # 分割选项
             options_list = [opt.strip() for opt in options_str.split('|')]
             
-            # 构建选项列表
             options = []
             for i, option_content in enumerate(options_list):
-                # 对于 Tarea 4，选项可能是 A、B、C、D
-                # 对于 Tarea 5，选项可能是具体的词
                 label = chr(65 + i) if len(options_list) <= 5 else str(i + 1)
                 
-                # 判断是否是正确答案
                 is_correct = False
                 if correct_answer.upper() == label:
                     is_correct = True
@@ -196,21 +357,13 @@ class SieleMarkupParser:
                 "options": options
             })
         
-        # 清理文本：将 [[gap...]] 替换为占位符
         cleaned_text = re.sub(pattern, r'___GAP\1___', text)
         
         return cleaned_text, questions, question_type
     
     def _extract_questions(self, text: str) -> Tuple[str, List[Dict]]:
-        """
-        提取独立题目（Tarea 1-3）
-        
-        Returns:
-            (清理后的文本, 题目列表)
-        """
         questions = []
         
-        # 匹配 ::question::...::question::
         question_pattern = r'::question::(.*?)::question::'
         matches = re.finditer(question_pattern, text, re.DOTALL)
         
@@ -219,18 +372,13 @@ class SieleMarkupParser:
             parsed_questions = self._parse_question_block(question_block)
             questions.extend(parsed_questions)
         
-        # 移除题目块
         cleaned_text = re.sub(question_pattern, '', text, flags=re.DOTALL)
         
         return cleaned_text, questions
     
     def _parse_question_block(self, block: str) -> List[Dict]:
-        """
-        解析独立题目块（Tarea 1-3）- 修复版本
-        """
         questions = []
         
-        # 使用 finditer 直接找到所有题目
         pattern = r'(\d+)\.\s+(.+?)(?=\d+\.\s+|$)'
         matches = re.finditer(pattern, block, re.DOTALL)
         
@@ -238,7 +386,6 @@ class SieleMarkupParser:
             question_num = int(match.group(1))
             question_content = match.group(2).strip()
             
-            # 提取题干和选项
             lines = question_content.split('\n')
             stem = lines[0].strip()
             
@@ -250,7 +397,6 @@ class SieleMarkupParser:
                 if not line:
                     continue
                 
-                # 匹配选项 [A] text
                 option_match = re.match(r'\[([A-Z])\]\s+(.+)', line)
                 if option_match:
                     label = option_match.group(1)
@@ -262,18 +408,15 @@ class SieleMarkupParser:
                         "is_correct": False
                     })
                 
-                # 匹配答案 ::answer:B::
                 answer_match = re.search(r'::answer:([A-Z])::', line)
                 if answer_match:
                     correct_answer = answer_match.group(1)
             
-            # 标记正确答案
             if correct_answer:
                 for opt in options:
                     if opt["label"] == correct_answer:
                         opt["is_correct"] = True
             
-            # 只添加有选项的题目
             if options:
                 questions.append({
                     "question_id": question_num,
@@ -285,7 +428,6 @@ class SieleMarkupParser:
         return questions
     
     def _remove_metadata_tags(self, text: str) -> str:
-        """移除元数据标记"""
         text = re.sub(r'::tarea:\d+::', '', text)
         text = re.sub(r'::title:.+?::', '', text)
         return text.strip()
@@ -296,21 +438,14 @@ class SieleMarkupParser:
         paragraph_id: int,
         start_char: int
     ) -> Dict[str, Any]:
-        """
-        解析单个段落
-        """
-        # 1. 提取西班牙语文本（第一部分，直到遇到标记）
         spanish_match = re.match(r'^(.*?)(?=::zh::|::grammar::|$)', raw_para, re.DOTALL)
         text_es = spanish_match.group(1).strip() if spanish_match else raw_para.strip()
         
-        # 移除完形填空的占位符（如果有）
         text_es = re.sub(r'___GAP\d+___', '[___]', text_es)
         
-        # 2. 提取中文翻译
         zh_match = re.search(r'::zh::(.*?)::zh::', raw_para, re.DOTALL)
         text_zh = zh_match.group(1).strip() if zh_match else ""
         
-        # 3. 提取语法讲解
         grammar_notes = []
         grammar_match = re.search(r'::grammar::(.*?)::grammar::', raw_para, re.DOTALL)
         
